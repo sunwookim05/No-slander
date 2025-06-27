@@ -1,124 +1,147 @@
-import torch
-import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
-from transformers import ElectraTokenizer, ElectraModel
-from torch.optim import AdamW
 import pandas as pd
-from sklearn.metrics import accuracy_score, f1_score
+import numpy as np
+import torch
+import random
 from tqdm import tqdm
+from sklearn.metrics import f1_score, accuracy_score
+from transformers import BertTokenizer, BertForSequenceClassification, get_linear_schedule_with_warmup
+from torch.optim import AdamW
+from torch.utils.data import TensorDataset, DataLoader, RandomSampler, SequentialSampler
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+from datasets import Dataset, DatasetDict
 
-# 설정
-PRETRAINED_MODEL_NAME = "monologg/koelectra-base-discriminator"
-MAX_LEN = 128
-BATCH_SIZE = 32
+# ======= 1. 설정 ========
+MAX_LEN = 64
+BATCH_SIZE = 16
 EPOCHS = 3
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# 데이터셋 클래스
-class HateSpeechDataset(Dataset):
-    def __init__(self, filepath, tokenizer, max_len):
-        self.data = pd.read_csv(filepath, sep='\t')
-        self.tokenizer = tokenizer
-        self.max_len = max_len
+# ======= 2. 시드 고정 ========
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
-    def __len__(self):
-        return len(self.data)
+set_seed(42)
 
-    def __getitem__(self, idx):
-        text = str(self.data.iloc[idx]['comments'])
-        label = int(self.data.iloc[idx]['label'])
+# ======= 3. 데이터 불러오기 및 전처리 ========
+train_df = pd.read_csv('./newhas_train.tsv', sep='\t')
+valid_df = pd.read_csv('./newhas_valid.tsv', sep='\t')
+test_df = pd.read_csv('./newhas_test.tsv', sep='\t')
 
-        encoding = self.tokenizer.encode_plus(
-            text,
-            truncation=True,
-            add_special_tokens=True,
-            max_length=self.max_len,
-            return_token_type_ids=False,
-            padding='max_length',
-            return_attention_mask=True,
-            return_tensors='pt'
-        )
+# [중요] 라벨 타입 변환
+# 👇 '2,3' 같은 라벨 처리
+train_df['label'] = train_df['label'].apply(lambda x: int(str(x).split(',')[0]))
+valid_df['label'] = valid_df['label'].apply(lambda x: int(str(x).split(',')[0]))
+test_df['label'] = test_df['label'].apply(lambda x: int(str(x).split(',')[0]))
 
-        return {
-            'input_ids': encoding['input_ids'].squeeze(),
-            'attention_mask': encoding['attention_mask'].squeeze(),
-            'label': torch.tensor(label, dtype=torch.long)
-        }
 
-# 모델 정의
-class ElectraClassifier(nn.Module):
-    def __init__(self, pretrained_model_name, num_classes=2):
-        super(ElectraClassifier, self).__init__()
-        self.electra = ElectraModel.from_pretrained(pretrained_model_name)
-        self.classifier = nn.Linear(self.electra.config.hidden_size, num_classes)
+# ======= 4. 토크나이저 ========
+tokenizer = BertTokenizer.from_pretrained('monologg/kobert')
 
-    def forward(self, input_ids, attention_mask):
-        outputs = self.electra(input_ids=input_ids, attention_mask=attention_mask)
-        pooled_output = outputs.last_hidden_state[:, 0]
-        return self.classifier(pooled_output)
+def preprocess_sentences(sentences):
+    return ['[CLS] ' + str(s) + ' [SEP]' for s in sentences]
 
-# 데이터 로딩
-tokenizer = ElectraTokenizer.from_pretrained(PRETRAINED_MODEL_NAME)
-train_dataset = HateSpeechDataset("newhas_train.tsv", tokenizer, MAX_LEN)
-valid_dataset = HateSpeechDataset("newhas_valid.tsv", tokenizer, MAX_LEN)
-test_dataset  = HateSpeechDataset("newhas_test.tsv", tokenizer, MAX_LEN)
+def tokenize(sentences):
+    tokenized = [tokenizer.encode(s, add_special_tokens=True, max_length=MAX_LEN, truncation=True) for s in sentences]
+    padded = pad_sequences(tokenized, maxlen=MAX_LEN, dtype="long", value=0, truncating="post", padding="post")
+    return torch.tensor(padded)
 
-train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-valid_loader = DataLoader(valid_dataset, batch_size=BATCH_SIZE)
-test_loader  = DataLoader(test_dataset, batch_size=BATCH_SIZE)
+def create_masks(input_ids):
+    return torch.tensor([[float(token > 0) for token in seq] for seq in input_ids])
 
-# 모델 준비
-model = ElectraClassifier(PRETRAINED_MODEL_NAME).to(DEVICE)
-optimizer = AdamW(model.parameters(), lr=2e-5)
-loss_fn = nn.CrossEntropyLoss()
+# ======= 5. 입력 데이터 처리 ========
+train_sentences = preprocess_sentences(train_df['document'])
+valid_sentences = preprocess_sentences(valid_df['document'])
+test_sentences = preprocess_sentences(test_df['document'])
 
-# 학습 함수
-def train(model, data_loader):
-    model.train()
-    total_loss = 0
-    for batch in tqdm(data_loader, desc="Training"):
-        input_ids = batch['input_ids'].to(DEVICE)
-        attention_mask = batch['attention_mask'].to(DEVICE)
-        labels = batch['label'].to(DEVICE)
+train_inputs = tokenize(train_sentences)
+valid_inputs = tokenize(valid_sentences)
+test_inputs = tokenize(test_sentences)
 
-        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-        loss = loss_fn(outputs, labels)
+train_masks = create_masks(train_inputs)
+valid_masks = create_masks(valid_inputs)
+test_masks = create_masks(test_inputs)
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+train_labels = torch.tensor(train_df['label'].values)
+valid_labels = torch.tensor(valid_df['label'].values)
+test_labels = torch.tensor(test_df['label'].values)
 
-        total_loss += loss.item()
-    return total_loss / len(data_loader)
+train_data = TensorDataset(train_inputs, train_masks, train_labels)
+valid_data = TensorDataset(valid_inputs, valid_masks, valid_labels)
+test_data = TensorDataset(test_inputs, test_masks, test_labels)
 
-# 평가 함수
-def evaluate(model, data_loader):
+train_loader = DataLoader(train_data, sampler=RandomSampler(train_data), batch_size=BATCH_SIZE)
+valid_loader = DataLoader(valid_data, sampler=SequentialSampler(valid_data), batch_size=BATCH_SIZE)
+test_loader = DataLoader(test_data, sampler=SequentialSampler(test_data), batch_size=BATCH_SIZE)
+
+# ======= 6. 모델 구성 ========
+model = BertForSequenceClassification.from_pretrained("monologg/kobert", num_labels=len(train_df['label'].unique()))
+model.to(DEVICE)
+
+optimizer = AdamW(model.parameters(), lr=2e-5, eps=1e-8)
+scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0, num_training_steps=len(train_loader)*EPOCHS)
+
+# ======= 7. 학습 및 평가 ========
+def train():
+    for epoch in range(EPOCHS):
+        model.train()
+        total_loss = 0
+        for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}"):
+            b_input_ids, b_input_mask, b_labels = [x.to(DEVICE) for x in batch]
+            model.zero_grad()
+            outputs = model(b_input_ids, attention_mask=b_input_mask, labels=b_labels)
+            loss = outputs.loss
+            total_loss += loss.item()
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+        print(f"Epoch {epoch+1} Loss: {total_loss/len(train_loader):.4f}")
+        evaluate()
+
+def evaluate():
     model.eval()
-    preds, true_labels = [], []
+    predictions, true_labels = [], []
+    for batch in valid_loader:
+        b_input_ids, b_input_mask, b_labels = [x.to(DEVICE) for x in batch]
+        with torch.no_grad():
+            outputs = model(b_input_ids, attention_mask=b_input_mask)
+        logits = outputs.logits
+        preds = torch.argmax(logits, dim=1).flatten()
+        predictions.extend(preds.cpu().numpy())
+        true_labels.extend(b_labels.cpu().numpy())
+    print("Validation Accuracy:", accuracy_score(true_labels, predictions))
+    print("Validation F1 Score:", f1_score(true_labels, predictions, average='macro'))
 
+# ======= 8. 예측 함수 ========
+def predict(sentence):
+    model.eval()
+    marked_text = "[CLS] " + sentence + " [SEP]"
+    tokenized_text = tokenizer.encode(marked_text, add_special_tokens=True, max_length=MAX_LEN, truncation=True)
+    input_id = pad_sequences([tokenized_text], maxlen=MAX_LEN, dtype="long", value=0, truncating="post", padding="post")
+    input_id = torch.tensor(input_id).to(DEVICE)
+    attention_mask = torch.tensor([[float(i > 0) for i in input_id[0]]]).to(DEVICE)
     with torch.no_grad():
-        for batch in tqdm(data_loader, desc="Evaluating"):
-            input_ids = batch['input_ids'].to(DEVICE)
-            attention_mask = batch['attention_mask'].to(DEVICE)
-            labels = batch['label'].to(DEVICE)
+        outputs = model(input_id, attention_mask=attention_mask)
+    logits = outputs.logits
+    predicted_label = torch.argmax(logits, dim=1).item()
+    return predicted_label
 
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-            _, predicted = torch.max(outputs, 1)
+# ======= 9. 실행 ========
+if __name__ == "__main__":
+    train()
 
-            preds.extend(predicted.cpu().numpy())
-            true_labels.extend(labels.cpu().numpy())
+    # 예측 테스트
+    print("\n🔥 예측 테스트:")
+    test_sentences = [
+        "노무현 대통령님 사랑합니다",
+        "노무현 운지 응디응디 딱",
+        "노무현은 빨갱이",
+        "노무현은 개새끼",
+        "전라도 좌빨 종북좌파 깜둥이 개새끼들"
+    ]
 
-    acc = accuracy_score(true_labels, preds)
-    f1 = f1_score(true_labels, preds, average='macro')
-    return acc, f1
-
-# 전체 학습 루프
-for epoch in range(EPOCHS):
-    print(f"\n[Epoch {epoch+1}]")
-    train_loss = train(model, train_loader)
-    val_acc, val_f1 = evaluate(model, valid_loader)
-    print(f"Train Loss: {train_loss:.4f} | Val Acc: {val_acc:.4f} | Val F1: {val_f1:.4f}")
-
-# 테스트 결과
-test_acc, test_f1 = evaluate(model, test_loader)
-print(f"\n[Test Performance] Acc: {test_acc:.4f} | F1: {test_f1:.4f}")
+    for sent in test_sentences:
+        label = predict(sent)
+        print(f"[{sent}] → 예측 라벨: {label}")
