@@ -8,11 +8,11 @@ from sklearn.metrics import f1_score, accuracy_score
 from transformers import BertTokenizer, BertForSequenceClassification, get_linear_schedule_with_warmup
 from torch.optim import AdamW
 from torch.utils.data import TensorDataset, DataLoader, RandomSampler, SequentialSampler
-from tensorflow.keras.preprocessing.sequence import pad_sequences
+from torch.nn.utils.rnn import pad_sequence
 
 # ======= 1. 설정 ========
-MAX_LEN = 64
-BATCH_SIZE = 16
+MAX_LEN = 256
+BATCH_SIZE = 32
 EPOCHS = 3
 
 # ======= 2. 디바이스 자동 선택 ========
@@ -53,12 +53,13 @@ test_df['label'] = test_df['label'].apply(lambda x: int(str(x).split(',')[0]))
 tokenizer = BertTokenizer.from_pretrained('monologg/kobert')
 
 def preprocess_sentences(sentences):
-    return ['[CLS] ' + str(s) + ' [SEP]' for s in sentences]
+    return [str(s) for s in sentences]  # 불필요한 [CLS], [SEP] 제거
+
 
 def tokenize(sentences):
-    tokenized = [tokenizer.encode(s, add_special_tokens=True, max_length=MAX_LEN, truncation=True) for s in sentences]
-    padded = pad_sequences(tokenized, maxlen=MAX_LEN, dtype="long", value=0, truncating="post", padding="post")
-    return torch.tensor(padded)
+    tokenized = [torch.tensor(tokenizer.encode(s, add_special_tokens=True, max_length=MAX_LEN, truncation=True)) for s in sentences]
+    padded = pad_sequence(tokenized, batch_first=True, padding_value=0)
+    return padded[:, :MAX_LEN] 
 
 def create_masks(input_ids):
     return torch.tensor([[float(token > 0) for token in seq] for seq in input_ids])
@@ -141,11 +142,12 @@ if __name__ == "__main__":
 
     print("\n🔥 예측 테스트:")
     test_sentences = [
-        "노무현 대통령님 사랑합니다",
-        "노무현 운지 응디응디 딱",
-        "노무현은 빨갱이",
-        "노무현은 개새끼",
-        "전라도 좌빨 종북좌파 깜둥이 개새끼들"
+        "중국은 무슨 암덩어리 같음 어떻게 저렇게 세계각지에 골고루 민폐만 끼치냐",
+        "한국은 진짜 세계에서 제일 잘 사는 나라다",
+        "이 영화는 정말 재미있었다! 강력 추천합니다.",
+        "이 제품은 가격 대비 성능이 뛰어나요.",
+        "넘나 이쁘셔...",
+        "역시 전라도 좌파야"
     ]
     for sent in test_sentences:
         label = predict(sent)
